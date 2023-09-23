@@ -314,7 +314,21 @@ impl BallistaContext {
             _ => Err(DataFusionError::Internal("Expected tables scan".to_owned())),
         }
     }
-
+    ///function registers a TableProvider as a view in the context and if the view already exists, it will be replaced
+    pub fn create_or_replace_view(&self, name: &str, table: Arc<dyn TableProvider>)-> Result<()> {
+        let mut state = self.state.lock();
+        if state.tables.contains_key(name) {
+            state.tables.remove(name);
+        }
+        state.tables.insert(name.to_owned(), table);
+        Ok(())
+    }
+    pub fn table(&self,name:&str) -> Result<DataFrame> {
+        let state = self.state.lock();
+        let table= state.tables.get(name).unwrap();
+        let plan = table.get_logical_plan().unwrap().to_owned();
+        Ok(DataFrame::new(self.context.state().clone(), plan))
+    }
     /// is a 'show *' sql
     pub async fn is_show_statement(&self, sql: &str) -> Result<bool> {
         let mut is_show_variable: bool = false;
@@ -516,6 +530,72 @@ mod tests {
         let df = context.sql("show columns from csv_with_timestamps;").await;
 
         assert!(df.is_err());
+    }
+    #[tokio::test]
+    #[cfg(feature = "standalone")]
+    async fn test_create_and_retrieve_view() {
+        use super::*;
+        use std::fs::File;
+        use std::io::Write;
+        use tempfile::TempDir;
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        let context = BallistaContext::standalone(&BallistaConfig::new().unwrap(), 1)
+            .await
+            .unwrap();
+
+        let data = "Jorge,2018-12-13T12:12:10.011Z\n\
+                    Andrew,2018-11-13T17:11:10.011Z";
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = tmp_dir.path().join("timestamps.csv");
+
+        // scope to ensure the file is closed and written
+        {
+            File::create(&file_path)
+                .expect("creating temp file")
+                .write_all(data.as_bytes())
+                .expect("writing data");
+        }
+
+        let sql = format!(
+            "CREATE EXTERNAL TABLE csv_with_timestamps (
+                  name VARCHAR,
+                  ts TIMESTAMP
+              )
+              STORED AS CSV
+              LOCATION '{}'
+              ",
+            file_path.to_str().expect("path is utf8")
+        );
+
+        context.sql(sql.as_str()).await.unwrap();
+        let df = context.sql("select * from csv_with_timestamps").await.unwrap();
+        let _= context.create_or_replace_view("test", df.into_view());
+        let query = context.sql("select * from test").await.unwrap();
+        query.show().await.unwrap();
+        let rdf = context.table("test").unwrap();
+        let modified  = rdf.clone().select_columns( &["name"]).unwrap();
+        let records = modified.clone().collect().await.unwrap();
+        let count = rdf.count().await.unwrap();
+
+        let expected1 = vec![
+            "+--------+",
+            "| name   |",
+            "+--------+",
+            "| Jorge  |",
+            "| Andrew |",
+            "+--------+",
+        ];
+        assert_eq!(
+            expected1,
+            pretty_format_batches(&records)
+                .unwrap()
+                .to_string()
+                .trim()
+                .lines()
+                .collect::<Vec<&str>>()
+        );
+       assert_eq!(count, 2);
     }
 
     #[tokio::test]
